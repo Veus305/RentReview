@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>RentReview</title>
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getFirestore, collection, getDocs, addDoc, setDoc, deleteDoc, updateDoc,
+    doc, query, orderBy
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  // ── PASTE YOUR FIREBASE CONFIG HERE ─────────────────────────────────────
+   const firebaseConfig = {
+    apiKey: "AIzaSyAF2NwamtnNunM9cukvIeaXqh4s8RU7FNc",
+    authDomain: "rentreview-626c8.firebaseapp.com",
+    projectId: "rentreview-626c8",
+    storageBucket: "rentreview-626c8.firebasestorage.app",
+    messagingSenderId: "767959705569",
+    appId: "1:767959705569:web:db655e309782db2d1454a0",
+    measurementId: "G-ST7663QX44"
+  };
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
+
+  // ── Firestore helpers ────────────────────────────────────────────────────
+  async function getCol(col, ...qArgs) {
+    const q = qArgs.length ? query(collection(db, col), ...qArgs) : collection(db, col);
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  }
+  async function addDoc2(col, data)     { return await addDoc(collection(db, col), data); }
+  async function setDoc2(col, id, data) { return await setDoc(doc(db, col, id), data); }
+  async function delDoc(col, id)        { return await deleteDoc(doc(db, col, id)); }
+  async function updDoc(col, id, data)  { return await updateDoc(doc(db, col, id), data); }
+
+  // ── AI Prefs (localStorage) ──────────────────────────────────────────────
+  const AI_DEFAULTS = {
+    apiKey:       "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",
+    model:        "llama-3.3-70b-versatile",
+    temperature:  0.7,
+    maxTokens:    1024,
+    systemPrompt: "You are Rent Review AI — an intelligent property management assistant embedded inside the Rent Review web app used by a Kenyan landlord. Your knowledge is strictly limited to the property data provided in each message. Do not invent tenants, rooms, bills, or any figures not present in the data. Be concise, direct, and practical. Use KES for currency. When answering, cite specific room names, tenant names, or months from the data. If the data does not contain enough information to answer, say so clearly."
+  };
+  const AVAILABLE_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
+  ];
+  const AiPrefs = {
+    get: (k)    => { try { return JSON.parse(localStorage.getItem('rr_ai_'+k)) ?? AI_DEFAULTS[k]; } catch(e){ return AI_DEFAULTS[k]; } },
+    set: (k, v) => { try { localStorage.setItem('rr_ai_'+k, JSON.stringify(v)); } catch(e){} },
+    reset: ()   => { Object.keys(AI_DEFAULTS).forEach(k => localStorage.removeItem('rr_ai_'+k)); }
+  };
+
+  // ── State ────────────────────────────────────────────────────────────────
+  let rooms = [], tenants = [], readings = [], bills = [], complaints = [];
+  let currentPage = 'dashboard';
+  let editTarget  = null;
+  let aiSnapshot  = null;          // cached property data for AI
+  let chatHistory = [];            // [{role,content}]
+
+  // ── Boot ─────────────────────────────────────────────────────────────────
+  window.addEventListener('DOMContentLoaded', () => {
+    checkLogin();
+    document.getElementById('loginBtn').addEventListener('click', doLogin);
+    document.getElementById('loginPass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+    document.querySelectorAll('[data-nav]').forEach(el => {
+      el.addEventListener('click', () => navigate(el.dataset.nav));
+    });
+    document.getElementById('logoutBtn').addEventListener('click', doLogout);
+
+    // AI chat input enter key
+    document.getElementById('aiInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiMessage(); }
+    });
+
+    // AI Settings — populate model dropdown
+    const ms = document.getElementById('ais-model');
+    AVAILABLE_MODELS.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = opt.textContent = m;
+      ms.appendChild(opt);
+    });
+  });
+
+  // ── Auth ─────────────────────────────────────────────────────────────────
+  function checkLogin() {
+    if (sessionStorage.getItem('rr_auth') === '1') showApp();
+    else showLogin();
+  }
+  function doLogin() {
+    const pw = document.getElementById('loginPass').value;
+    if (pw === 'RENT') {
+      sessionStorage.setItem('rr_auth', '1');
+      document.getElementById('loginPass').value = '';
+      showApp();
+    } else {
+      document.getElementById('loginError').style.display = 'block';
+      document.getElementById('loginPass').value = '';
+    }
+  }
+  function doLogout()  { sessionStorage.removeItem('rr_auth'); showLogin(); }
+  function showLogin() { document.getElementById('loginScreen').style.display='flex'; document.getElementById('appShell').style.display='none'; }
+  function showApp()   { document.getElementById('loginScreen').style.display='none'; document.getElementById('appShell').style.display='flex'; navigate('dashboard'); }
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+  function navigate(page) {
+    currentPage = page;
+    document.querySelectorAll('[data-nav]').forEach(el => el.classList.toggle('active', el.dataset.nav===page));
+    document.querySelectorAll('.page').forEach(p => p.style.display = p.id==='page-'+page ? 'block' : 'none');
+    document.getElementById('sidebar').classList.remove('open');
+    const titles = { dashboard:'Dashboard', rooms:'Rooms', tenants:'Tenants', readings:'Meter Readings', billing:'Billing', complaints:'Complaints & Notes', ai:'AI Assistant' };
+    document.getElementById('topbar-title').textContent = titles[page] || page;
+    loadPage(page);
+  }
+
+  async function loadPage(page) {
+    setLoading(page, true);
+    try {
+      switch(page) {
+        case 'dashboard':  await loadDashboard();  break;
+        case 'rooms':      await loadRooms();       break;
+        case 'tenants':    await loadTenants();     break;
+        case 'readings':   await loadReadings();    break;
+        case 'billing':    await loadBilling();     break;
+        case 'complaints': await loadComplaints();  break;
+        case 'ai':         await initAiPage();      break;
+      }
+    } catch(e) { showToast('Firebase error: '+e.message,'error'); console.error(e); }
+    setLoading(page, false);
+  }
+
+  function setLoading(page, on) {
+    const el = document.querySelector(`#page-${page} .page-loader`);
+    if (el) el.style.display = on ? 'flex' : 'none';
+  }
+
+  // ── DASHBOARD ─────────────────────────────────────────────────────────────
+  async function loadDashboard() {
+    [rooms, tenants, bills, complaints] = await Promise.all([
+      getCol('rooms', orderBy('name')),
+      getCol('tenants', orderBy('name')),
+      getCol('bills', orderBy('month','desc')),
+      getCol('complaints', orderBy('date','desc')),
+    ]);
+    const occupied=rooms.filter(r=>r.status==='occupied').length;
+    const vacant=rooms.filter(r=>r.status==='vacant').length;
+    const maintenance=rooms.filter(r=>r.status==='maintenance').length;
+    const revenue=bills.filter(b=>b.paid).reduce((s,b)=>s+(b.total||0),0);
+    const pending=bills.filter(b=>!b.paid);
+    const openComp=complaints.filter(c=>c.status!=='resolved').length;
+    document.getElementById('stat-rooms').textContent      = rooms.length;
+    document.getElementById('stat-occupied').textContent   = occupied;
+    document.getElementById('stat-vacant').textContent     = vacant;
+    document.getElementById('stat-maintenance').textContent= maintenance;
+    document.getElementById('stat-revenue').textContent    = 'KES '+revenue.toLocaleString('en-KE',{minimumFractionDigits:0});
+    document.getElementById('stat-pending-count').textContent = pending.length;
+    document.getElementById('stat-complaints').textContent = openComp;
+    document.getElementById('stat-tenants').textContent    = tenants.length;
+    const ul = document.getElementById('pending-list');
+    if(pending.length===0){ ul.innerHTML='<li class="empty-item">✓ All bills settled</li>'; }
+    else { ul.innerHTML=pending.slice(0,8).map(b=>{ const room=rooms.find(r=>r.id===b.roomId); return `<li class="pending-item"><span class="pi-room">${room?room.name:'Unknown'} <span class="pi-month">${b.month||''}</span></span><span class="pi-amt">KES ${(b.total||0).toLocaleString('en-KE',{minimumFractionDigits:0})}</span><button class="btn-xs btn-green" onclick="markPaid('${b.id}')">Mark Paid</button></li>`; }).join(''); }
+    const cl=document.getElementById('complaints-preview');
+    const openList=complaints.filter(c=>c.status!=='resolved').slice(0,5);
+    if(openList.length===0){ cl.innerHTML='<li class="empty-item">No open issues</li>'; }
+    else { cl.innerHTML=openList.map(c=>{ const room=rooms.find(r=>r.id===c.roomId); return `<li class="pending-item"><span class="pi-room">${room?room.name:'—'} <span class="pi-month tag-${c.type}">${c.type}</span></span><span class="comp-subject">${c.subject||''}</span><span class="status-badge status-${c.status}">${c.status}</span></li>`; }).join(''); }
+  }
+  window.markPaid = async function(billId) {
+    try { await updDoc('bills',billId,{paid:true}); showToast('Marked as paid'); await loadDashboard(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+
+  // ── ROOMS ─────────────────────────────────────────────────────────────────
+  async function loadRooms() {
+    rooms = await getCol('rooms', orderBy('name'));
+    const grid = document.getElementById('rooms-grid');
+    if(rooms.length===0){ grid.innerHTML='<div class="empty-state"><div class="empty-icon">🏠</div><p>No rooms yet. Add your first room.</p></div>'; return; }
+    grid.innerHTML=rooms.map(r=>`
+      <div class="room-card">
+        <div class="room-card-header"><span class="room-name">${r.name}</span><span class="status-badge status-${r.status}">${r.status}</span></div>
+        <div class="room-meta">${r.floor?`<span>Floor ${r.floor}</span>`:''} ${r.desc?`<span>${r.desc}</span>`:''}</div>
+        <div class="room-rates">
+          <div class="rate-pill">🏠 KES ${(r.rent||0).toLocaleString()}/mo</div>
+          <div class="rate-pill">💧 ${r.waterRate||0}/unit</div>
+          <div class="rate-pill">⚡ ${r.powerRate||0}/kWh</div>
+        </div>
+        ${r.paymentDesc?`<div class="room-notes">${r.paymentDesc}</div>`:''}
+        <div class="card-actions">
+          <button class="btn-sm btn-secondary" onclick="editRoom('${r.id}')">Edit</button>
+          <button class="btn-sm btn-danger" onclick="deleteRoom('${r.id}','${r.name}')">Delete</button>
+        </div>
+      </div>`).join('');
+  }
+  window.editRoom = function(id) {
+    const r=rooms.find(x=>x.id===id); if(!r) return;
+    editTarget=r;
+    fillForm('room-form',{'rf-name':r.name,'rf-floor':r.floor,'rf-desc':r.desc,'rf-rent':r.rent,'rf-waterRate':r.waterRate,'rf-powerRate':r.powerRate,'rf-initWater':r.initWater,'rf-initPower':r.initPower,'rf-paymentDesc':r.paymentDesc,'rf-status':r.status});
+    document.getElementById('room-form-title').textContent='Edit Room';
+    openModal('modal-room');
+  };
+  window.deleteRoom = async function(id,name) {
+    if(!confirm(`Delete room "${name}"?`)) return;
+    try{ await delDoc('rooms',id); showToast('Room deleted'); await loadRooms(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+  window.saveRoom = async function() {
+    const name=val('rf-name'); if(!name){ showToast('Room name required','error'); return; }
+    const data={name,floor:val('rf-floor'),desc:val('rf-desc'),rent:num('rf-rent'),waterRate:num('rf-waterRate'),powerRate:num('rf-powerRate'),initWater:num('rf-initWater'),initPower:num('rf-initPower'),paymentDesc:val('rf-paymentDesc'),status:val('rf-status')||'vacant'};
+    try{
+      if(editTarget) await setDoc2('rooms',editTarget.id,data); else await addDoc2('rooms',data);
+      showToast(editTarget?'Room updated':'Room added'); closeModal('modal-room'); await loadRooms();
+    }catch(e){ showToast(e.message,'error'); }
+  };
+
+  // ── TENANTS ───────────────────────────────────────────────────────────────
+  async function loadTenants() {
+    [rooms,tenants]=await Promise.all([getCol('rooms',orderBy('name')),getCol('tenants',orderBy('name'))]);
+    populateRoomSelect('tf-roomId');
+    const tbody=document.getElementById('tenants-tbody');
+    if(tenants.length===0){ tbody.innerHTML='<tr><td colspan="7" class="empty-td">No tenants yet.</td></tr>'; return; }
+    tbody.innerHTML=tenants.map(t=>{ const room=rooms.find(r=>r.id===t.roomId); return `<tr><td><strong>${t.name}</strong><br><small class="text-dim">${t.idNum||''}</small></td><td>${room?room.name:'<em>Unassigned</em>'}</td><td>${t.phone||'—'}</td><td>${t.email||'—'}</td><td>${t.moveIn||'—'}</td><td>${t.leaseEnd||'—'}</td><td class="td-actions"><button class="btn-xs btn-secondary" onclick="editTenant('${t.id}')">Edit</button><button class="btn-xs btn-danger" onclick="deleteTenant('${t.id}','${t.name}')">Delete</button></td></tr>`; }).join('');
+  }
+  window.editTenant = function(id) {
+    const t=tenants.find(x=>x.id===id); if(!t) return;
+    editTarget=t;
+    fillForm('tenant-form',{'tf-name':t.name,'tf-idNum':t.idNum,'tf-phone':t.phone,'tf-email':t.email,'tf-gender':t.gender,'tf-occupants':t.occupants,'tf-moveIn':t.moveIn,'tf-leaseEnd':t.leaseEnd,'tf-roomId':t.roomId,'tf-deposit':t.deposit,'tf-notes':t.notes});
+    document.getElementById('tenant-form-title').textContent='Edit Tenant';
+    openModal('modal-tenant');
+  };
+  window.deleteTenant = async function(id,name) {
+    if(!confirm(`Remove tenant "${name}"?`)) return;
+    try{ await delDoc('tenants',id); showToast('Tenant removed'); await loadTenants(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+  window.saveTenant = async function() {
+    const name=val('tf-name'); if(!name){ showToast('Name required','error'); return; }
+    const data={name,idNum:val('tf-idNum'),phone:val('tf-phone'),email:val('tf-email'),gender:val('tf-gender'),occupants:parseInt(val('tf-occupants'))||1,moveIn:val('tf-moveIn'),leaseEnd:val('tf-leaseEnd'),roomId:val('tf-roomId'),deposit:num('tf-deposit'),notes:val('tf-notes')};
+    try{
+      if(editTarget) await setDoc2('tenants',editTarget.id,data); else await addDoc2('tenants',data);
+      if(data.roomId) await updDoc('rooms',data.roomId,{status:'occupied'});
+      showToast(editTarget?'Tenant updated':'Tenant added'); closeModal('modal-tenant'); await loadTenants();
+    }catch(e){ showToast(e.message,'error'); }
+  };
+
+  // ── READINGS ──────────────────────────────────────────────────────────────
+  async function loadReadings() {
+    [rooms,readings]=await Promise.all([getCol('rooms',orderBy('name')),getCol('readings',orderBy('date','desc'))]);
+    populateRoomSelect('rdf-roomId');
+    populateRoomFilter('readings-room-filter',readings);
+    renderReadings(readings);
+  }
+  function renderReadings(list) {
+    const tbody=document.getElementById('readings-tbody');
+    if(list.length===0){ tbody.innerHTML='<tr><td colspan="7" class="empty-td">No readings recorded.</td></tr>'; return; }
+    tbody.innerHTML=list.map(r=>{ const room=rooms.find(x=>x.id===r.roomId); return `<tr><td>${r.date||'—'}</td><td>${room?room.name:'—'}</td><td class="num-cell">💧 ${r.water??'—'}</td><td class="num-cell">⚡ ${r.power??'—'}</td><td><span class="status-badge status-${r.rentStatus||'unpaid'}">${r.rentStatus||'—'}</span></td><td class="num-cell">${r.amountPaid?'KES '+r.amountPaid.toLocaleString():'—'}</td><td><button class="btn-xs btn-danger" onclick="deleteReading('${r.id}')">✕</button></td></tr>`; }).join('');
+  }
+  window.filterReadings = function() { const roomId=document.getElementById('readings-room-filter').value; renderReadings(roomId?readings.filter(r=>r.roomId===roomId):readings); };
+  window.deleteReading = async function(id) {
+    if(!confirm('Delete this reading?')) return;
+    try{ await delDoc('readings',id); showToast('Deleted'); await loadReadings(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+  window.saveReading = async function() {
+    const roomId=val('rdf-roomId'),date=val('rdf-date');
+    if(!roomId||!date){ showToast('Room and date required','error'); return; }
+    const data={roomId,date,water:num('rdf-water'),power:num('rdf-power'),rentStatus:val('rdf-rentStatus')||'paid',amountPaid:num('rdf-amountPaid'),notes:val('rdf-notes')};
+    try{ await addDoc2('readings',data); showToast('Reading saved'); closeModal('modal-reading'); await loadReadings(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+
+  // ── BILLING ───────────────────────────────────────────────────────────────
+  async function loadBilling() {
+    [rooms,bills,readings]=await Promise.all([getCol('rooms',orderBy('name')),getCol('bills',orderBy('month','desc')),getCol('readings',orderBy('date','desc'))]);
+    populateRoomSelect('bf-roomId');
+    populateRoomFilter('bills-room-filter',bills);
+    document.getElementById('bf-roomId').onchange=function(){
+      const room=rooms.find(r=>r.id===this.value); if(!room) return;
+      setVal('bf-baseRent',room.rent); setVal('bf-waterRate',room.waterRate); setVal('bf-powerRate',room.powerRate);
+      const rr=readings.filter(r=>r.roomId===room.id).sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+      if(rr.length>=2){ setVal('bf-waterInit',rr[1].water); setVal('bf-waterFinal',rr[0].water); setVal('bf-powerInit',rr[1].power); setVal('bf-powerFinal',rr[0].power); }
+      else if(rr.length===1){ setVal('bf-waterInit',room.initWater); setVal('bf-waterFinal',rr[0].water); setVal('bf-powerInit',room.initPower); setVal('bf-powerFinal',rr[0].power); }
+      else{ setVal('bf-waterInit',room.initWater); setVal('bf-powerInit',room.initPower); }
+      calculateBill();
+    };
+    setDefaultMonth(); renderBills(bills);
+  }
+  function setDefaultMonth(){ const now=new Date(); setVal('bf-month',`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`); }
+  window.calculateBill = function(){
+    const wI=num('bf-waterInit'),wF=num('bf-waterFinal'),pI=num('bf-powerInit'),pF=num('bf-powerFinal');
+    const wR=num('bf-waterRate'),pR=num('bf-powerRate'),rent=num('bf-baseRent');
+    const wUsed=Math.max(0,wF-wI),pUsed=Math.max(0,pF-pI),wCost=wUsed*wR,pCost=pUsed*pR,total=rent+wCost+pCost;
+    document.getElementById('bill-preview').style.display='block';
+    document.getElementById('bp-water').textContent=`Water: ${wI} → ${wF}  (${wUsed.toFixed(2)} units × ${wR}) = KES ${wCost.toFixed(2)}`;
+    document.getElementById('bp-power').textContent=`Power: ${pI} → ${pF}  (${pUsed.toFixed(2)} kWh × ${pR}) = KES ${pCost.toFixed(2)}`;
+    document.getElementById('bp-rent').textContent=`Rent: KES ${rent.toFixed(2)}`;
+    document.getElementById('bp-total').textContent=`Total: KES ${total.toFixed(2)}`;
+    document.getElementById('saveBillBtn').disabled=false;
+  };
+  window.saveBill = async function(){
+    const roomId=val('bf-roomId'),month=val('bf-month');
+    if(!roomId){ showToast('Select a room','error'); return; }
+    if(!month){ showToast('Month required','error'); return; }
+    const wI=num('bf-waterInit'),wF=num('bf-waterFinal'),pI=num('bf-powerInit'),pF=num('bf-powerFinal');
+    const wR=num('bf-waterRate'),pR=num('bf-powerRate'),rent=num('bf-baseRent');
+    const wUsed=Math.max(0,wF-wI),pUsed=Math.max(0,pF-pI),wCost=wUsed*wR,pCost=pUsed*pR;
+    const data={roomId,month,rent,waterInit:wI,waterFinal:wF,waterUsed:wUsed,waterRate:wR,waterCost:wCost,powerInit:pI,powerFinal:pF,powerUsed:pUsed,powerRate:pR,powerCost:pCost,total:rent+wCost+pCost,paid:false};
+    try{ await addDoc2('bills',data); showToast('Bill saved'); closeModal('modal-billing'); await loadBilling(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+  window.togglePaid = async function(id,current){ try{ await updDoc('bills',id,{paid:!current}); showToast(!current?'Marked paid':'Marked unpaid'); await loadBilling(); }catch(e){ showToast(e.message,'error'); } };
+  window.deleteBill = async function(id){ if(!confirm('Delete this bill?')) return; try{ await delDoc('bills',id); showToast('Deleted'); await loadBilling(); }catch(e){ showToast(e.message,'error'); } };
+  function renderBills(list){
+    const tbody=document.getElementById('bills-tbody');
+    if(list.length===0){ tbody.innerHTML='<tr><td colspan="7" class="empty-td">No bills yet.</td></tr>'; return; }
+    tbody.innerHTML=list.map(b=>{ const room=rooms.find(r=>r.id===b.roomId); return `<tr class="${b.paid?'row-paid':''}"><td>${b.month||'—'}</td><td>${room?room.name:'—'}</td><td class="num-cell">KES ${(b.waterCost||0).toFixed(2)}</td><td class="num-cell">KES ${(b.powerCost||0).toFixed(2)}</td><td class="num-cell">KES ${(b.rent||0).toFixed(2)}</td><td class="num-cell total-cell">KES ${(b.total||0).toLocaleString('en-KE',{minimumFractionDigits:2})}</td><td class="td-actions"><button class="btn-xs ${b.paid?'btn-secondary':'btn-green'}" onclick="togglePaid('${b.id}',${b.paid})">${b.paid?'Paid ✓':'Mark Paid'}</button><button class="btn-xs btn-danger" onclick="deleteBill('${b.id}')">✕</button></td></tr>`; }).join('');
+  }
+  window.filterBills = function(){ const roomId=document.getElementById('bills-room-filter').value; renderBills(roomId?bills.filter(b=>b.roomId===roomId):bills); };
+
+  // ── COMPLAINTS ────────────────────────────────────────────────────────────
+  async function loadComplaints(){
+    [rooms,complaints]=await Promise.all([getCol('rooms',orderBy('name')),getCol('complaints',orderBy('date','desc'))]);
+    populateRoomSelect('cf-roomId'); populateRoomFilter('complaints-room-filter',complaints);
+    renderComplaints(complaints);
+  }
+  function renderComplaints(list){
+    const grid=document.getElementById('complaints-grid');
+    if(list.length===0){ grid.innerHTML='<div class="empty-state"><div class="empty-icon">📋</div><p>No items logged.</p></div>'; return; }
+    grid.innerHTML=list.map(c=>{ const room=rooms.find(r=>r.id===c.roomId); return `<div class="complaint-card type-${c.type}"><div class="complaint-header"><span class="tag-${c.type} comp-type-badge">${c.type}</span><span class="status-badge status-${c.status}">${c.status}</span><span class="comp-date">${c.date||''}</span></div><div class="comp-room">${room?room.name:'—'}</div><div class="comp-subject">${c.subject||''}</div><div class="comp-body">${c.body||''}</div><div class="card-actions">${c.status!=='resolved'?`<button class="btn-sm btn-green" onclick="resolveComplaint('${c.id}')">Resolve</button>`:''}<button class="btn-sm btn-danger" onclick="deleteComplaint('${c.id}')">Delete</button></div></div>`; }).join('');
+  }
+  window.filterComplaints = function(){
+    const roomId=document.getElementById('complaints-room-filter').value;
+    const status=document.getElementById('complaints-status-filter').value;
+    let list=complaints;
+    if(roomId) list=list.filter(c=>c.roomId===roomId);
+    if(status) list=list.filter(c=>c.status===status);
+    renderComplaints(list);
+  };
+  window.resolveComplaint = async function(id){ try{ await updDoc('complaints',id,{status:'resolved'}); showToast('Marked resolved'); await loadComplaints(); }catch(e){ showToast(e.message,'error'); } };
+  window.deleteComplaint  = async function(id){ if(!confirm('Delete this entry?')) return; try{ await delDoc('complaints',id); showToast('Deleted'); await loadComplaints(); }catch(e){ showToast(e.message,'error'); } };
+  window.saveComplaint = async function(){
+    const subject=val('cf-subject'); if(!subject){ showToast('Subject required','error'); return; }
+    const data={roomId:val('cf-roomId'),type:val('cf-type')||'complaint',subject,body:val('cf-body'),status:'open',date:new Date().toISOString().slice(0,10)};
+    try{ await addDoc2('complaints',data); showToast('Logged'); closeModal('modal-complaint'); await loadComplaints(); }
+    catch(e){ showToast(e.message,'error'); }
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  AI PAGE
+  // ═══════════════════════════════════════════════════════════════════════
+
+  async function initAiPage() {
+    updateModelBadge();
+    if (!document.getElementById('ai-messages').children.length) {
+      appendAiBubble("Hello! I'm your Rent Review AI agent. I have full access to all your property data — rooms, tenants, bills, meter readings, and complaints. What would you like to know?");
+      await prefetchAiData();
+    }
+  }
+
+  async function prefetchAiData() {
+    setAiThinking(true);
+    try {
+      const [r,t,b,rd,c] = await Promise.all([
+        getCol('rooms',orderBy('name')),
+        getCol('tenants',orderBy('name')),
+        getCol('bills',orderBy('month','desc')),
+        getCol('readings',orderBy('date','desc')),
+        getCol('complaints',orderBy('date','desc'))
+      ]);
+      aiSnapshot = { rooms:r, tenants:t, bills:b, readings:rd, complaints:c };
+      setAiThinking(false);
+      appendAiBubble(`✓ Property data loaded — ${r.length} rooms · ${t.length} tenants · ${b.length} bills · ${rd.length} readings · ${c.length} complaints.\n\nAsk me anything!`);
+    } catch(e) {
+      setAiThinking(false);
+      appendAiBubble('⚠ Could not load property data: ' + e.message);
+    }
+  }
+
+  window.sendAiMessage = async function() {
+    const input = document.getElementById('aiInput');
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    appendUserBubble(q);
+    setAiThinking(true);
+    document.getElementById('ai-send-btn').disabled = true;
+
+    if (!aiSnapshot) {
+      try {
+        const [r,t,b,rd,c] = await Promise.all([
+          getCol('rooms',orderBy('name')),
+          getCol('tenants',orderBy('name')),
+          getCol('bills',orderBy('month','desc')),
+          getCol('readings',orderBy('date','desc')),
+          getCol('complaints',orderBy('date','desc'))
+        ]);
+        aiSnapshot = { rooms:r, tenants:t, bills:b, readings:rd, complaints:c };
+      } catch(e) {
+        setAiThinking(false);
+        document.getElementById('ai-send-btn').disabled=false;
+        appendAiBubble('⚠ Could not load data: '+e.message);
+        return;
+      }
+    }
+
+    const propertyContext = buildPromptString(aiSnapshot);
+    const userMessage = `=== PROPERTY DATA ===\n${propertyContext}\n=== END DATA ===\n\nQuestion: ${q}`;
+
+    // Add to chat history (keep last 6 turns to save tokens)
+    chatHistory.push({ role:'user', content: userMessage });
+    if (chatHistory.length > 12) chatHistory = chatHistory.slice(-12);
+
+    try {
+      const answer = await callGroq(chatHistory);
+      chatHistory.push({ role:'assistant', content: answer });
+      setAiThinking(false);
+      document.getElementById('ai-send-btn').disabled=false;
+      appendAiBubble(answer);
+    } catch(e) {
+      setAiThinking(false);
+      document.getElementById('ai-send-btn').disabled=false;
+      appendAiBubble('⚠ '+e.message);
+    }
+  };
+
+  async function callGroq(messages) {
+    const apiKey = AiPrefs.get('apiKey');
+    if (!apiKey) throw new Error('No API key set. Go to AI Settings to add your Groq key.');
+    const body = {
+      model:       AiPrefs.get('model'),
+      max_tokens:  AiPrefs.get('maxTokens'),
+      temperature: AiPrefs.get('temperature'),
+      messages: [
+        { role:'system', content: AiPrefs.get('systemPrompt') },
+        ...messages
+      ]
+    };
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+apiKey.trim() },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data?.error?.message || JSON.stringify(data);
+      throw new Error('Groq error '+res.status+': '+msg);
+    }
+    return data.choices[0].message.content.trim();
+  }
+
+  function buildPromptString(snap) {
+    let sb = '';
+    sb += `ROOMS (${snap.rooms.length}):\n`;
+    snap.rooms.forEach(r => {
+      sb += `  - [${r.id}] ${r.name} | Floor:${r.floor||''} | Rent:${r.rent||0} | Status:${r.status} | WaterRate:${r.waterRate||0} PowerRate:${r.powerRate||0}\n`;
+    });
+    sb += `\nTENANTS (${snap.tenants.length}):\n`;
+    snap.tenants.forEach(t => {
+      sb += `  - [${t.id}] ${t.name} | Phone:${t.phone||''} | Room:${t.roomId||''} | Move-in:${t.moveIn||''} | Lease-end:${t.leaseEnd||''} | Deposit:${t.deposit||0} | Occupants:${t.occupants||1}\n`;
+    });
+    let totalRevenue=0, totalPending=0;
+    sb += `\nBILLS (${snap.bills.length}):\n`;
+    snap.bills.forEach(b => {
+      sb += `  - Room:${b.roomId} | Month:${b.month} | Rent:${b.rent||0} | Water:${b.waterCost||0} | Power:${b.powerCost||0} | Total:${b.total||0} | Paid:${b.paid?'YES':'NO'}\n`;
+      if(b.paid) totalRevenue+=(b.total||0); else totalPending+=(b.total||0);
+    });
+    sb += `  SUMMARY: Collected revenue=${totalRevenue.toFixed(0)} | Outstanding=${totalPending.toFixed(0)}\n`;
+    sb += `\nMETER READINGS (${snap.readings.length}):\n`;
+    snap.readings.slice(0,20).forEach(r => {
+      sb += `  - Room:${r.roomId} | Date:${r.date} | Water:${r.water||0} | Power:${r.power||0} | Rent-status:${r.rentStatus||''}\n`;
+    });
+    if(snap.readings.length>20) sb += `  ... (${snap.readings.length-20} older readings omitted)\n`;
+    sb += `\nCOMPLAINTS/NOTES (${snap.complaints.length}):\n`;
+    snap.complaints.forEach(c => {
+      sb += `  - [${c.id}] Room:${c.roomId||''} | Type:${c.type} | Subject:${c.subject} | Status:${c.status} | Date:${c.date}\n`;
+      if(c.body) sb += `    Body: ${c.body}\n`;
+    });
+    return sb;
+  }
+
+  window.clearAiChat = function() {
+    document.getElementById('ai-messages').innerHTML = '';
+    chatHistory = [];
+    appendAiBubble("Chat cleared. Hello again! I'm your Rent Review AI agent. What would you like to know about your property?");
+  };
+
+  window.refreshAiData = async function() {
+    aiSnapshot = null;
+    chatHistory = [];
+    appendAiBubble('♻ Refreshing property data…');
+    await prefetchAiData();
+  };
+
+  function appendUserBubble(text) {
+    const msgs = document.getElementById('ai-messages');
+    const div = document.createElement('div');
+    div.className = 'chat-bubble user-bubble';
+    div.textContent = text;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function appendAiBubble(text) {
+    const msgs = document.getElementById('ai-messages');
+    const div = document.createElement('div');
+    div.className = 'chat-bubble ai-bubble';
+    // Basic markdown-ish: bold, line breaks
+    div.innerHTML = text
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>')
+      .replace(/\n/g,'<br>');
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  function setAiThinking(on) {
+    document.getElementById('ai-thinking').style.display = on ? 'flex' : 'none';
+  }
+
+  function updateModelBadge() {
+    const badge = document.getElementById('ai-model-badge');
+    if (!badge) return;
+    const model = AiPrefs.get('model');
+    const short = model.length > 20 ? model.substring(0,20)+'…' : model;
+    badge.textContent = '⚡ ' + short;
+  }
+
+  // ── AI SETTINGS ───────────────────────────────────────────────────────────
+  window.openAiSettings = function() {
+    // Load current values into form
+    setVal('ais-apikey', AiPrefs.get('apiKey'));
+    document.getElementById('ais-model').value = AiPrefs.get('model');
+    const temp = AiPrefs.get('temperature');
+    document.getElementById('ais-temp').value = Math.round(temp*100);
+    document.getElementById('ais-temp-label').textContent = temp.toFixed(2);
+    const tokens = AiPrefs.get('maxTokens');
+    const step = Math.max(0, Math.min(31, Math.round(tokens/128)-1));
+    document.getElementById('ais-tokens').value = step;
+    document.getElementById('ais-tokens-label').textContent = (step+1)*128;
+    setVal('ais-prompt', AiPrefs.get('systemPrompt'));
+    document.getElementById('ais-test-result').style.display = 'none';
+    // mask key
+    document.getElementById('ais-apikey').type = 'password';
+    document.getElementById('ais-toggle-key').textContent = '👁';
+    openModal('modal-ai-settings');
+  };
+
+  window.saveAiSettings = function() {
+    const key    = val('ais-apikey');
+    const model  = document.getElementById('ais-model').value;
+    const temp   = parseInt(document.getElementById('ais-temp').value)/100;
+    const tokens = (parseInt(document.getElementById('ais-tokens').value)+1)*128;
+    const prompt = val('ais-prompt');
+    if(!key)   { showToast('API key cannot be empty','error'); return; }
+    if(!prompt){ showToast('System prompt cannot be empty','error'); return; }
+    AiPrefs.set('apiKey', key);
+    AiPrefs.set('model',  model);
+    AiPrefs.set('temperature', temp);
+    AiPrefs.set('maxTokens',   tokens);
+    AiPrefs.set('systemPrompt', prompt);
+    updateModelBadge();
+    showToast('AI settings saved ✓');
+    closeModal('modal-ai-settings');
+  };
+
+  window.resetAiDefaults = function() {
+    if(!confirm('Reset all AI settings to defaults?')) return;
+    AiPrefs.reset();
+    openAiSettings(); // reload form
+    showToast('Settings reset to defaults');
+  };
+
+  window.toggleKeyVisible = function() {
+    const el  = document.getElementById('ais-apikey');
+    const btn = document.getElementById('ais-toggle-key');
+    if(el.type==='password'){ el.type='text';  btn.textContent='🙈'; }
+    else                    { el.type='password'; btn.textContent='👁'; }
+  };
+
+  window.pasteApiKey = async function() {
+    try {
+      const text = await navigator.clipboard.readText();
+      setVal('ais-apikey', text.trim());
+      showToast('Key pasted from clipboard');
+    } catch(e) { showToast('Could not read clipboard','error'); }
+  };
+
+  window.clearApiKey = function() {
+    if(!confirm('Clear the saved API key?')) return;
+    setVal('ais-apikey','');
+    showToast('Key cleared');
+  };
+
+  window.testApiKey = async function() {
+    const key = val('ais-apikey');
+    if(!key){ showToast('Enter an API key first','error'); return; }
+    const btn = document.getElementById('ais-test-btn');
+    const result = document.getElementById('ais-test-result');
+    btn.disabled=true; btn.textContent='Testing…';
+    result.style.display='none';
+    try {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions',{
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+key.trim()},
+        body:JSON.stringify({model:AI_DEFAULTS.model,max_tokens:10,temperature:0.1,messages:[{role:'system',content:'You are a test assistant.'},{role:'user',content:'Reply with exactly: KEY_OK'}]})
+      });
+      const data=await res.json();
+      if(res.ok){
+        result.textContent='✓ Connection successful!';
+        result.className='test-result success';
+      } else {
+        result.textContent='✗ '+( data?.error?.message||res.status);
+        result.className='test-result error';
+      }
+    } catch(e) {
+      result.textContent='✗ Network error: '+e.message;
+      result.className='test-result error';
+    }
+    result.style.display='block';
+    btn.disabled=false; btn.textContent='Test Connection';
+  };
+
+  // Temperature + Tokens sliders
+  window.onTempChange = function(v) {
+    document.getElementById('ais-temp-label').textContent = (v/100).toFixed(2);
+  };
+  window.onTokensChange = function(v) {
+    document.getElementById('ais-tokens-label').textContent = ((parseInt(v)+1)*128);
+  };
+
+  // ── Quick-ask suggestions ─────────────────────────────────────────────────
+  window.askSuggestion = function(q) {
+    document.getElementById('aiInput').value = q;
+    sendAiMessage();
+  };
+
+  // ── Shared UI helpers ─────────────────────────────────────────────────────
+  function val(id)    { return (document.getElementById(id)||{}).value?.trim()||''; }
+  function num(id)    { return parseFloat(val(id))||0; }
+  function setVal(id,v){ const el=document.getElementById(id); if(el) el.value=v??''; }
+  function fillForm(fId,map){ Object.entries(map).forEach(([id,v])=>setVal(id,v)); }
+
+  function populateRoomSelect(id) {
+    const sel=document.getElementById(id); if(!sel) return;
+    const cur=sel.value;
+    sel.innerHTML='<option value="">— Select room —</option>'+rooms.map(r=>`<option value="${r.id}">${r.name}</option>`).join('');
+    if(cur) sel.value=cur;
+  }
+  function populateRoomFilter(id,data) {
+    const sel=document.getElementById(id); if(!sel) return;
+    const ids=[...new Set(data.map(x=>x.roomId).filter(Boolean))];
+    sel.innerHTML='<option value="">All rooms</option>'+ids.map(rid=>{ const room=rooms.find(r=>r.id===rid); return `<option value="${rid}">${room?room.name:rid}</option>`; }).join('');
+  }
+
+  function openModal(id) {
+    document.getElementById(id).style.display='flex';
+    const bp=document.getElementById('bill-preview'); if(bp) bp.style.display='none';
+    const sb=document.getElementById('saveBillBtn');  if(sb) sb.disabled=true;
+  }
+  function closeModal(id) {
+    document.getElementById(id).style.display='none';
+    editTarget=null;
+    document.querySelectorAll(`#${id} input:not([data-keep]),#${id} textarea:not([data-keep]),#${id} select:not([data-keep])`).forEach(el=>{
+      if(el.tagName==='SELECT') el.selectedIndex=0; else el.value='';
+    });
+  }
+  function showToast(msg,type='success') {
+    const t=document.getElementById('toast');
+    t.textContent=msg; t.className='toast toast-'+type;
+    t.style.display='block';
+    setTimeout(()=>{ t.style.display='none'; },3000);
+  }
+
+  window.openModal=openModal; window.closeModal=closeModal;
+  window.saveRoom=saveRoom; window.saveTenant=saveTenant;
+  window.saveReading=saveReading; window.saveBill=saveBill;
+  window.saveComplaint=saveComplaint;
+  window.filterReadings=filterReadings; window.filterBills=filterBills;
+  window.filterComplaints=filterComplaints; window.calculateBill=calculateBill;
+  window.toggleSidebar = function(){ document.getElementById('sidebar').classList.toggle('open'); };
+  window.openNewModal = function(id) {
+    editTarget=null;
+    const titleMap={'modal-room':['room-form-title','Add Room'],'modal-tenant':['tenant-form-title','Add Tenant'],'modal-reading':['reading-form-title','Add Reading'],'modal-billing':['billing-form-title','Generate Bill'],'modal-complaint':['complaint-form-title','Log Entry']};
+    const [tid,ttxt]=titleMap[id]||[];
+    if(tid){ document.getElementById(tid).textContent=ttxt; }
+    openModal(id);
+  };
+</script>
+
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0F1117;--bg2:#161B27;--card:#1E2433;--border:#2A3144;--input:#1E2433;
+  --txt:#E2E8F0;--txt2:#8892A4;--dim:#5A6478;
+  --accent:#4F72FF;--accentD:#3A5CE0;
+  --green:#10B981;--amber:#F59E0B;--red:#EF4444;--purple:#8B5CF6;
+  --radius:10px;--sidebar:220px;
+}
+body{background:var(--bg);color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;min-height:100vh}
+
+/* ── Login ── */
+#loginScreen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:var(--bg)}
+.login-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:40px 36px;width:340px;text-align:center}
+.login-logo{font-size:38px;margin-bottom:8px}.login-brand{font-size:22px;font-weight:700;letter-spacing:-.5px}.login-sub{color:var(--txt2);font-size:13px;margin-bottom:28px}
+.login-box input{width:100%;padding:11px 14px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius);color:var(--txt);font-size:15px;margin-bottom:12px;text-align:center;letter-spacing:3px}
+.login-box input:focus{outline:none;border-color:var(--accent)}
+.btn-login{width:100%;padding:12px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:15px;font-weight:600;cursor:pointer;transition:background .15s}
+.btn-login:hover{background:var(--accentD)}
+#loginError{color:var(--red);font-size:13px;margin-top:10px;display:none}
+
+/* ── Shell ── */
+#appShell{display:flex;min-height:100vh}
+
+/* ── Sidebar ── */
+#sidebar{width:var(--sidebar);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100;transition:transform .25s}
+.sidebar-brand{padding:22px 20px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.brand-icon{font-size:22px}.brand-name{font-size:17px;font-weight:700;letter-spacing:-.3px}
+.nav-list{list-style:none;padding:12px 0;flex:1;overflow-y:auto}
+.nav-list a{display:flex;align-items:center;gap:10px;padding:10px 20px;color:var(--txt2);text-decoration:none;transition:all .15s;font-size:14px}
+.nav-list a:hover{color:var(--txt);background:rgba(79,114,255,.08)}
+.nav-list a.active{color:var(--accent);background:rgba(79,114,255,.12);font-weight:600}
+.nav-icon{font-size:16px;width:20px;text-align:center}
+.sidebar-footer{padding:16px 20px;border-top:1px solid var(--border)}
+.btn-logout{width:100%;padding:9px;background:transparent;border:1px solid var(--border);color:var(--txt2);border-radius:var(--radius);cursor:pointer;font-size:13px;transition:all .15s}
+.btn-logout:hover{border-color:var(--red);color:var(--red)}
+
+/* ── Main ── */
+#mainContent{margin-left:var(--sidebar);flex:1;display:flex;flex-direction:column;min-height:100vh}
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50}
+.topbar-title{font-size:16px;font-weight:600}.hamburger{display:none;background:none;border:none;color:var(--txt2);font-size:20px;cursor:pointer;padding:4px}
+.page-content{padding:24px;flex:1}
+
+/* ── Page header ── */
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px}
+.page-title{font-size:20px;font-weight:700}
+.page-loader{display:flex;align-items:center;justify-content:center;padding:60px;color:var(--txt2);font-size:13px}
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;margin-right:10px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── Dashboard ── */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px;margin-bottom:28px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px 16px}
+.stat-label{color:var(--txt2);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.stat-value{font-size:26px;font-weight:700;line-height:1}
+.stat-value.accent{color:var(--accent)}.stat-value.green{color:var(--green)}.stat-value.amber{color:var(--amber)}.stat-value.red{color:var(--red)}.stat-value.dim{color:var(--txt2)}
+.dash-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.dash-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px}
+.dash-card-title{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--txt2);margin-bottom:14px;font-weight:600}
+#pending-list,#complaints-preview{list-style:none}
+.pending-item{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.pending-item:last-child{border-bottom:none}
+.pi-room{flex:1;color:var(--txt)}.pi-month{color:var(--txt2);font-size:12px;margin-left:6px}.pi-amt{color:var(--amber);font-weight:600}
+.comp-subject{color:var(--txt2);font-size:12px;flex:1}
+.empty-item{color:var(--dim);font-size:13px;padding:12px 0;text-align:center}
+
+/* ── Rooms ── */
+#rooms-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.room-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;display:flex;flex-direction:column;gap:10px}
+.room-card-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.room-name{font-size:16px;font-weight:700}
+.room-meta{color:var(--txt2);font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
+.room-rates{display:flex;gap:8px;flex-wrap:wrap}
+.rate-pill{background:rgba(79,114,255,.1);border:1px solid rgba(79,114,255,.2);color:var(--accent);border-radius:20px;padding:3px 10px;font-size:12px}
+.room-notes{font-size:12px;color:var(--txt2);font-style:italic}
+
+/* ── Table ── */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th{background:var(--bg2);color:var(--txt2);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);font-weight:600}
+td{padding:10px 14px;border-bottom:1px solid var(--border);color:var(--txt);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.02)}
+.empty-td{text-align:center;color:var(--dim);padding:40px 14px}
+.num-cell{text-align:right;font-variant-numeric:tabular-nums}
+.total-cell{color:var(--amber);font-weight:600}
+.td-actions{display:flex;gap:6px;justify-content:flex-end}
+.row-paid td{opacity:.55}
+.text-dim{color:var(--dim)}
+
+/* ── Complaints ── */
+#complaints-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.complaint-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;display:flex;flex-direction:column;gap:8px}
+.complaint-card.type-maintenance{border-left:3px solid var(--amber)}
+.complaint-card.type-complaint{border-left:3px solid var(--red)}
+.complaint-card.type-compliment{border-left:3px solid var(--green)}
+.complaint-card.type-note{border-left:3px solid var(--accent)}
+.complaint-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.comp-date{margin-left:auto;color:var(--dim);font-size:11px}
+.comp-room{font-size:13px;font-weight:600;color:var(--txt2)}
+.comp-subject{font-size:14px;font-weight:600}
+.comp-body{font-size:13px;color:var(--txt2);line-height:1.5}
+.comp-type-badge{font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;padding:2px 8px;border-radius:20px}
+
+/* ── Status badges ── */
+.status-badge{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:600;text-transform:capitalize}
+.status-occupied{background:rgba(16,185,129,.15);color:var(--green)}
+.status-vacant{background:rgba(79,114,255,.15);color:var(--accent)}
+.status-maintenance{background:rgba(245,158,11,.15);color:var(--amber)}
+.status-paid{background:rgba(16,185,129,.15);color:var(--green)}
+.status-partial{background:rgba(245,158,11,.15);color:var(--amber)}
+.status-unpaid{background:rgba(239,68,68,.15);color:var(--red)}
+.status-open{background:rgba(239,68,68,.15);color:var(--red)}
+.status-in-progress{background:rgba(245,158,11,.15);color:var(--amber)}
+.status-resolved{background:rgba(16,185,129,.15);color:var(--green)}
+.tag-complaint{background:rgba(239,68,68,.15);color:var(--red)}
+.tag-maintenance{background:rgba(245,158,11,.15);color:var(--amber)}
+.tag-compliment{background:rgba(16,185,129,.15);color:var(--green)}
+.tag-note{background:rgba(79,114,255,.15);color:var(--accent)}
+
+/* ── Buttons ── */
+.btn-primary{padding:9px 18px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:14px;font-weight:600;cursor:pointer;transition:background .15s;white-space:nowrap}
+.btn-primary:hover{background:var(--accentD)}
+.btn-sm{padding:6px 12px;font-size:12px;border-radius:6px;cursor:pointer;font-weight:500;border:1px solid;transition:all .15s}
+.btn-xs{padding:4px 9px;font-size:11px;border-radius:5px;cursor:pointer;font-weight:500;border:1px solid;transition:all .15s}
+.btn-secondary{background:transparent;border-color:var(--border);color:var(--txt2)}
+.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+.btn-danger{background:transparent;border-color:var(--red);color:var(--red)}
+.btn-danger:hover{background:rgba(239,68,68,.1)}
+.btn-green{background:transparent;border-color:var(--green);color:var(--green)}
+.btn-green:hover{background:rgba(16,185,129,.1)}
+.btn-icon{background:transparent;border:1px solid var(--border);color:var(--txt2);padding:6px 10px;border-radius:6px;cursor:pointer;font-size:14px;transition:all .15s}
+.btn-icon:hover{border-color:var(--accent);color:var(--accent)}
+.card-actions{display:flex;gap:8px;margin-top:auto}
+.filter-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;align-items:center}
+.filter-row select,.filter-row input{padding:7px 12px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);color:var(--txt);font-size:13px}
+.filter-row select:focus,.filter-row input:focus{outline:none;border-color:var(--accent)}
+
+/* ── Modals ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);align-items:center;justify-content:center;z-index:200;padding:16px}
+.modal-box{background:var(--card);border:1px solid var(--border);border-radius:14px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;display:flex;flex-direction:column}
+.modal-header{padding:18px 22px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-title{font-size:16px;font-weight:700}
+.modal-close{background:none;border:none;color:var(--txt2);font-size:20px;cursor:pointer;line-height:1}
+.modal-close:hover{color:var(--txt)}
+.modal-body{padding:20px 22px;display:flex;flex-direction:column;gap:14px}
+.modal-footer{padding:14px 22px;border-top:1px solid var(--border);display:flex;gap:10px;justify-content:flex-end}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-group{display:flex;flex-direction:column;gap:5px}
+.form-group label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--txt2);font-weight:600}
+.form-group input,.form-group select,.form-group textarea{padding:9px 12px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius);color:var(--txt);font-size:14px}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:var(--accent)}
+.form-group textarea{resize:vertical;min-height:80px;font-family:inherit}
+.form-group select option{background:var(--card)}
+.full{grid-column:1/-1}
+#bill-preview{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;font-size:13px;line-height:1.7;display:none}
+#bp-total{font-size:15px;font-weight:700;color:var(--amber);margin-top:4px}
+
+/* ── AI Page ── */
+#page-ai{display:flex;flex-direction:column;height:calc(100vh - 58px)}
+.ai-layout{display:flex;gap:0;flex:1;overflow:hidden}
+.ai-sidebar{width:260px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;overflow-y:auto}
+.ai-sidebar-section{padding:16px}
+.ai-sidebar-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:600;margin-bottom:10px}
+.ai-model-badge{background:rgba(79,114,255,.12);border:1px solid rgba(79,114,255,.25);color:var(--accent);border-radius:20px;padding:4px 12px;font-size:12px;font-weight:600;display:inline-block;margin-bottom:12px}
+.ai-actions{display:flex;flex-direction:column;gap:8px}
+.ai-actions button{text-align:left;padding:8px 12px;font-size:13px}
+.ai-divider{height:1px;background:var(--border);margin:4px 0}
+.suggestion-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:600;margin-bottom:8px;padding:16px 16px 0}
+.suggestion-list{padding:0 16px 16px;display:flex;flex-direction:column;gap:6px}
+.suggestion-chip{background:rgba(79,114,255,.07);border:1px solid rgba(79,114,255,.18);color:var(--txt2);border-radius:8px;padding:8px 12px;font-size:12px;cursor:pointer;text-align:left;transition:all .15s;line-height:1.4}
+.suggestion-chip:hover{background:rgba(79,114,255,.15);color:var(--txt);border-color:var(--accent)}
+
+.ai-main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.ai-chat-area{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
+#ai-messages{display:flex;flex-direction:column;gap:14px}
+.chat-bubble{max-width:78%;padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.6;word-break:break-word}
+.ai-bubble{background:var(--card);border:1px solid var(--border);border-radius:12px 12px 12px 2px;color:var(--txt);align-self:flex-start}
+.user-bubble{background:var(--accent);color:#fff;border-radius:12px 12px 2px 12px;align-self:flex-end}
+#ai-thinking{display:none;align-items:center;gap:10px;color:var(--txt2);font-size:13px;font-style:italic;padding:4px 0}
+.thinking-dots span{display:inline-block;width:6px;height:6px;background:var(--accent);border-radius:50%;animation:bounce .9s ease-in-out infinite}
+.thinking-dots span:nth-child(2){animation-delay:.15s}
+.thinking-dots span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-6px)}}
+
+.ai-input-bar{padding:14px 20px;border-top:1px solid var(--border);background:var(--bg2);display:flex;gap:10px;align-items:flex-end}
+#aiInput{flex:1;padding:10px 14px;background:var(--input);border:1px solid var(--border);border-radius:var(--radius);color:var(--txt);font-size:14px;resize:none;font-family:inherit;max-height:120px;overflow-y:auto}
+#aiInput:focus{outline:none;border-color:var(--accent)}
+#ai-send-btn{padding:10px 18px;background:var(--accent);color:#fff;border:none;border-radius:var(--radius);font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s;flex-shrink:0}
+#ai-send-btn:hover{background:var(--accentD)}
+#ai-send-btn:disabled{opacity:.5;cursor:not-allowed}
+.ai-scope-note{font-size:11px;color:var(--dim);text-align:center;padding:6px 20px}
+
+/* ── AI Settings Modal ── */
+.settings-section{border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px}
+.settings-section-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);font-weight:600;margin-bottom:2px}
+.key-row{display:flex;gap:6px;align-items:center}
+.key-row input{flex:1}
+.slider-row{display:flex;align-items:center;gap:10px}
+.slider-row input[type=range]{flex:1;accent-color:var(--accent)}
+.slider-val{min-width:38px;text-align:right;color:var(--accent);font-weight:600;font-size:13px}
+.test-result{padding:8px 12px;border-radius:6px;font-size:13px;margin-top:4px;display:none}
+.test-result.success{background:rgba(16,185,129,.12);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.test-result.error{background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+
+/* ── Empty state ── */
+.empty-state{text-align:center;padding:60px 20px;color:var(--txt2);grid-column:1/-1}
+.empty-icon{font-size:40px;margin-bottom:12px}
+
+/* ── Toast ── */
+#toast{position:fixed;bottom:24px;right:24px;display:none;padding:12px 20px;border-radius:var(--radius);font-size:14px;z-index:999;max-width:320px}
+.toast-success{background:var(--green);color:#fff}
+.toast-error{background:var(--red);color:#fff}
+
+/* ── Responsive ── */
+@media(max-width:768px){
+  #sidebar{transform:translateX(-100%)}
+  #sidebar.open{transform:translateX(0);box-shadow:4px 0 20px rgba(0,0,0,.4)}
+  #mainContent{margin-left:0}
+  .hamburger{display:block}
+  .form-row{grid-template-columns:1fr}
+  .dash-grid{grid-template-columns:1fr}
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .ai-sidebar{display:none}
+  .ai-layout{flex-direction:column}
+  #page-ai{height:auto}
+  .ai-chat-area{min-height:50vh}
+}
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="loginScreen">
+  <div class="login-box">
+    <div class="login-logo">🏠</div>
+    <div class="login-brand">RentReview</div>
+    <div class="login-sub">Property Management</div>
+    <input type="password" id="loginPass" placeholder="Enter password" autocomplete="current-password"/>
+    <button class="btn-login" id="loginBtn">Sign In</button>
+    <div id="loginError">Incorrect password. Try again.</div>
+  </div>
+</div>
+
+<!-- App -->
+<div id="appShell" style="display:none">
+  <nav id="sidebar">
+    <div class="sidebar-brand"><span class="brand-icon">🏠</span><span class="brand-name">RentReview</span></div>
+    <ul class="nav-list">
+      <li><a href="#" data-nav="dashboard"><span class="nav-icon">📊</span>Dashboard</a></li>
+      <li><a href="#" data-nav="rooms"><span class="nav-icon">🚪</span>Rooms</a></li>
+      <li><a href="#" data-nav="tenants"><span class="nav-icon">👤</span>Tenants</a></li>
+      <li><a href="#" data-nav="readings"><span class="nav-icon">🔢</span>Readings</a></li>
+      <li><a href="#" data-nav="billing"><span class="nav-icon">🧾</span>Billing</a></li>
+      <li><a href="#" data-nav="complaints"><span class="nav-icon">📋</span>Complaints</a></li>
+      <li><a href="#" data-nav="ai"><span class="nav-icon">🤖</span>AI Assistant</a></li>
+    </ul>
+    <div class="sidebar-footer"><button class="btn-logout" id="logoutBtn">Sign Out</button></div>
+  </nav>
+
+  <div id="mainContent">
+    <div class="topbar">
+      <button class="hamburger" onclick="toggleSidebar()">☰</button>
+      <span class="topbar-title" id="topbar-title">Dashboard</span>
+      <span></span>
+    </div>
+
+    <div class="page-content">
+
+      <!-- DASHBOARD -->
+      <div class="page" id="page-dashboard">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Dashboard</h1></div>
+        <div class="stat-grid">
+          <div class="stat-card"><div class="stat-label">Total Rooms</div><div class="stat-value accent" id="stat-rooms">—</div></div>
+          <div class="stat-card"><div class="stat-label">Occupied</div><div class="stat-value green" id="stat-occupied">—</div></div>
+          <div class="stat-card"><div class="stat-label">Vacant</div><div class="stat-value" id="stat-vacant">—</div></div>
+          <div class="stat-card"><div class="stat-label">Maintenance</div><div class="stat-value amber" id="stat-maintenance">—</div></div>
+          <div class="stat-card"><div class="stat-label">Paid Revenue</div><div class="stat-value green" id="stat-revenue" style="font-size:16px">—</div></div>
+          <div class="stat-card"><div class="stat-label">Unpaid Bills</div><div class="stat-value red" id="stat-pending-count">—</div></div>
+          <div class="stat-card"><div class="stat-label">Open Issues</div><div class="stat-value amber" id="stat-complaints">—</div></div>
+          <div class="stat-card"><div class="stat-label">Tenants</div><div class="stat-value dim" id="stat-tenants">—</div></div>
+        </div>
+        <div class="dash-grid">
+          <div class="dash-card"><div class="dash-card-title">Pending Payments</div><ul id="pending-list"></ul></div>
+          <div class="dash-card"><div class="dash-card-title">Open Issues</div><ul id="complaints-preview"></ul></div>
+        </div>
+      </div>
+
+      <!-- ROOMS -->
+      <div class="page" id="page-rooms" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Rooms</h1><button class="btn-primary" onclick="openNewModal('modal-room')">+ Add Room</button></div>
+        <div id="rooms-grid"></div>
+      </div>
+
+      <!-- TENANTS -->
+      <div class="page" id="page-tenants" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Tenants</h1><button class="btn-primary" onclick="openNewModal('modal-tenant')">+ Add Tenant</button></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>Name / ID</th><th>Room</th><th>Phone</th><th>Email</th><th>Move-in</th><th>Lease End</th><th></th></tr></thead>
+          <tbody id="tenants-tbody"></tbody></table>
+        </div>
+      </div>
+
+      <!-- READINGS -->
+      <div class="page" id="page-readings" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Meter Readings</h1><button class="btn-primary" onclick="openNewModal('modal-reading')">+ Add Reading</button></div>
+        <div class="filter-row"><select id="readings-room-filter" onchange="filterReadings()"></select></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>Date</th><th>Room</th><th>Water</th><th>Power</th><th>Rent Status</th><th>Amount Paid</th><th></th></tr></thead>
+          <tbody id="readings-tbody"></tbody></table>
+        </div>
+      </div>
+
+      <!-- BILLING -->
+      <div class="page" id="page-billing" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Billing</h1><button class="btn-primary" onclick="openNewModal('modal-billing')">+ Generate Bill</button></div>
+        <div class="filter-row"><select id="bills-room-filter" onchange="filterBills()"></select></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>Month</th><th>Room</th><th>Water</th><th>Power</th><th>Rent</th><th>Total</th><th></th></tr></thead>
+          <tbody id="bills-tbody"></tbody></table>
+        </div>
+      </div>
+
+      <!-- COMPLAINTS -->
+      <div class="page" id="page-complaints" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="page-header"><h1 class="page-title">Complaints & Notes</h1><button class="btn-primary" onclick="openNewModal('modal-complaint')">+ Log Entry</button></div>
+        <div class="filter-row">
+          <select id="complaints-room-filter" onchange="filterComplaints()"></select>
+          <select id="complaints-status-filter" onchange="filterComplaints()">
+            <option value="">All statuses</option><option value="open">Open</option>
+            <option value="in-progress">In Progress</option><option value="resolved">Resolved</option>
+          </select>
+        </div>
+        <div id="complaints-grid"></div>
+      </div>
+
+      <!-- AI ASSISTANT -->
+      <div class="page" id="page-ai" style="display:none">
+        <div class="page-loader"><div class="spinner"></div>Loading…</div>
+        <div class="ai-layout">
+
+          <!-- AI Sidebar -->
+          <div class="ai-sidebar">
+            <div class="ai-sidebar-section">
+              <div class="ai-sidebar-title">Active Model</div>
+              <div class="ai-model-badge" id="ai-model-badge">⚡ llama-3.3-70b-versatile</div>
+              <div class="ai-actions">
+                <button class="btn-sm btn-secondary" onclick="openAiSettings()">⚙ AI Settings</button>
+                <button class="btn-sm btn-secondary" onclick="refreshAiData()">♻ Refresh Data</button>
+                <button class="btn-sm btn-secondary" onclick="clearAiChat()">🗑 Clear Chat</button>
+              </div>
+            </div>
+            <div class="ai-divider"></div>
+            <div class="suggestion-title">Quick Questions</div>
+            <div class="suggestion-list">
+              <button class="suggestion-chip" onclick="askSuggestion('Which rooms are currently vacant?')">Which rooms are currently vacant?</button>
+              <button class="suggestion-chip" onclick="askSuggestion('Show me all unpaid bills and the total outstanding amount.')">Total outstanding bills?</button>
+              <button class="suggestion-chip" onclick="askSuggestion('Which tenants have leases ending in the next 3 months?')">Leases expiring soon?</button>
+              <button class="suggestion-chip" onclick="askSuggestion('Summarise all open complaints and maintenance requests.')">Open complaints summary</button>
+              <button class="suggestion-chip" onclick="askSuggestion('What is the total collected revenue so far?')">Total collected revenue?</button>
+              <button class="suggestion-chip" onclick="askSuggestion('Which room has the highest monthly rent?')">Highest rent room?</button>
+              <button class="suggestion-chip" onclick="askSuggestion('List all tenants with their assigned rooms and contact details.')">All tenants list</button>
+              <button class="suggestion-chip" onclick="askSuggestion('Are there any tenants with partial or unpaid rent status in the readings?')">Rent payment issues?</button>
+            </div>
+          </div>
+
+          <!-- Chat -->
+          <div class="ai-main">
+            <div class="ai-chat-area">
+              <div id="ai-messages"></div>
+              <div id="ai-thinking">
+                <div class="thinking-dots"><span></span><span></span><span></span></div>
+                Analysing your property data…
+              </div>
+            </div>
+            <div class="ai-scope-note">Powered by your live Firestore data · Groq AI · Fully private</div>
+            <div class="ai-input-bar">
+              <textarea id="aiInput" placeholder="Ask anything about your property…" rows="1"></textarea>
+              <button id="ai-send-btn" onclick="sendAiMessage()">Send ↑</button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div><!-- /page-content -->
+  </div><!-- /mainContent -->
+</div><!-- /appShell -->
+
+<!-- ════ MODALS ════ -->
+
+<!-- Room -->
+<div class="modal-overlay" id="modal-room" onclick="if(event.target===this)closeModal('modal-room')">
+  <div class="modal-box">
+    <div class="modal-header"><span class="modal-title" id="room-form-title">Add Room</span><button class="modal-close" onclick="closeModal('modal-room')">×</button></div>
+    <div class="modal-body" id="room-form">
+      <div class="form-row">
+        <div class="form-group"><label>Room Name *</label><input id="rf-name" placeholder="e.g. A1"/></div>
+        <div class="form-group"><label>Floor</label><input id="rf-floor" placeholder="e.g. Ground"/></div>
+      </div>
+      <div class="form-group full"><label>Description</label><input id="rf-desc" placeholder="Studio, bedsitter…"/></div>
+      <div class="form-row">
+        <div class="form-group"><label>Monthly Rent (KES)</label><input id="rf-rent" type="number" placeholder="0"/></div>
+        <div class="form-group"><label>Status</label><select id="rf-status"><option value="vacant">Vacant</option><option value="occupied">Occupied</option><option value="maintenance">Maintenance</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Water Rate (per unit)</label><input id="rf-waterRate" type="number" placeholder="0"/></div>
+        <div class="form-group"><label>Power Rate (per kWh)</label><input id="rf-powerRate" type="number" placeholder="0"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Initial Water Reading</label><input id="rf-initWater" type="number" placeholder="0"/></div>
+        <div class="form-group"><label>Initial Power Reading</label><input id="rf-initPower" type="number" placeholder="0"/></div>
+      </div>
+      <div class="form-group full"><label>Payment Notes</label><input id="rf-paymentDesc" placeholder="e.g. Pay by 5th of each month"/></div>
+    </div>
+    <div class="modal-footer"><button class="btn-sm btn-secondary" onclick="closeModal('modal-room')">Cancel</button><button class="btn-primary" onclick="saveRoom()">Save Room</button></div>
+  </div>
+</div>
+
+<!-- Tenant -->
+<div class="modal-overlay" id="modal-tenant" onclick="if(event.target===this)closeModal('modal-tenant')">
+  <div class="modal-box">
+    <div class="modal-header"><span class="modal-title" id="tenant-form-title">Add Tenant</span><button class="modal-close" onclick="closeModal('modal-tenant')">×</button></div>
+    <div class="modal-body" id="tenant-form">
+      <div class="form-row">
+        <div class="form-group"><label>Full Name *</label><input id="tf-name"/></div>
+        <div class="form-group"><label>ID / Passport No.</label><input id="tf-idNum"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Phone</label><input id="tf-phone" type="tel"/></div>
+        <div class="form-group"><label>Email</label><input id="tf-email" type="email"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Gender</label><select id="tf-gender"><option value="">—</option><option value="male">Male</option><option value="female">Female</option><option value="other">Other</option></select></div>
+        <div class="form-group"><label>Occupants</label><input id="tf-occupants" type="number" value="1" min="1"/></div>
+      </div>
+      <div class="form-group full"><label>Assign Room</label><select id="tf-roomId"></select></div>
+      <div class="form-row">
+        <div class="form-group"><label>Move-in Date</label><input id="tf-moveIn" type="date"/></div>
+        <div class="form-group"><label>Lease End</label><input id="tf-leaseEnd" type="date"/></div>
+      </div>
+      <div class="form-group"><label>Deposit (KES)</label><input id="tf-deposit" type="number" placeholder="0"/></div>
+      <div class="form-group full"><label>Notes</label><textarea id="tf-notes" rows="2"></textarea></div>
+    </div>
+    <div class="modal-footer"><button class="btn-sm btn-secondary" onclick="closeModal('modal-tenant')">Cancel</button><button class="btn-primary" onclick="saveTenant()">Save Tenant</button></div>
+  </div>
+</div>
+
+<!-- Reading -->
+<div class="modal-overlay" id="modal-reading" onclick="if(event.target===this)closeModal('modal-reading')">
+  <div class="modal-box">
+    <div class="modal-header"><span class="modal-title" id="reading-form-title">Add Reading</span><button class="modal-close" onclick="closeModal('modal-reading')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group"><label>Room *</label><select id="rdf-roomId"></select></div>
+        <div class="form-group"><label>Date *</label><input id="rdf-date" type="date"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>💧 Water Reading</label><input id="rdf-water" type="number" placeholder="0"/></div>
+        <div class="form-group"><label>⚡ Power Reading</label><input id="rdf-power" type="number" placeholder="0"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Rent Status</label><select id="rdf-rentStatus"><option value="paid">Paid</option><option value="partial">Partial</option><option value="unpaid">Unpaid</option></select></div>
+        <div class="form-group"><label>Amount Paid (KES)</label><input id="rdf-amountPaid" type="number" placeholder="0"/></div>
+      </div>
+      <div class="form-group full"><label>Notes</label><textarea id="rdf-notes" rows="2"></textarea></div>
+    </div>
+    <div class="modal-footer"><button class="btn-sm btn-secondary" onclick="closeModal('modal-reading')">Cancel</button><button class="btn-primary" onclick="saveReading()">Save Reading</button></div>
+  </div>
+</div>
+
+<!-- Billing -->
+<div class="modal-overlay" id="modal-billing" onclick="if(event.target===this)closeModal('modal-billing')">
+  <div class="modal-box">
+    <div class="modal-header"><span class="modal-title" id="billing-form-title">Generate Bill</span><button class="modal-close" onclick="closeModal('modal-billing')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group"><label>Room *</label><select id="bf-roomId"></select></div>
+        <div class="form-group"><label>Month *</label><input id="bf-month" type="month"/></div>
+      </div>
+      <div class="form-group"><label>Base Rent (KES)</label><input id="bf-baseRent" type="number" placeholder="0"/></div>
+      <div class="form-row">
+        <div class="form-group"><label>💧 Water Init</label><input id="bf-waterInit" type="number" placeholder="0" oninput="calculateBill()"/></div>
+        <div class="form-group"><label>💧 Water Final</label><input id="bf-waterFinal" type="number" placeholder="0" oninput="calculateBill()"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>⚡ Power Init</label><input id="bf-powerInit" type="number" placeholder="0" oninput="calculateBill()"/></div>
+        <div class="form-group"><label>⚡ Power Final</label><input id="bf-powerFinal" type="number" placeholder="0" oninput="calculateBill()"/></div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Water Rate</label><input id="bf-waterRate" type="number" placeholder="0" oninput="calculateBill()"/></div>
+        <div class="form-group"><label>Power Rate</label><input id="bf-powerRate" type="number" placeholder="0" oninput="calculateBill()"/></div>
+      </div>
+      <div id="bill-preview">
+        <div id="bp-water"></div><div id="bp-power"></div><div id="bp-rent"></div>
+        <hr style="border-color:var(--border);margin:8px 0"/><div id="bp-total"></div>
+      </div>
+    </div>
+    <div class="modal-footer"><button class="btn-sm btn-secondary" onclick="closeModal('modal-billing')">Cancel</button><button class="btn-primary" id="saveBillBtn" onclick="saveBill()" disabled>Save Bill</button></div>
+  </div>
+</div>
+
+<!-- Complaint -->
+<div class="modal-overlay" id="modal-complaint" onclick="if(event.target===this)closeModal('modal-complaint')">
+  <div class="modal-box">
+    <div class="modal-header"><span class="modal-title" id="complaint-form-title">Log Entry</span><button class="modal-close" onclick="closeModal('modal-complaint')">×</button></div>
+    <div class="modal-body">
+      <div class="form-row">
+        <div class="form-group"><label>Room</label><select id="cf-roomId"></select></div>
+        <div class="form-group"><label>Type</label><select id="cf-type"><option value="complaint">Complaint</option><option value="maintenance">Maintenance</option><option value="note">Note</option><option value="compliment">Compliment</option></select></div>
+      </div>
+      <div class="form-group full"><label>Subject *</label><input id="cf-subject" placeholder="Brief summary…"/></div>
+      <div class="form-group full"><label>Details</label><textarea id="cf-body" rows="4" placeholder="Full description…"></textarea></div>
+    </div>
+    <div class="modal-footer"><button class="btn-sm btn-secondary" onclick="closeModal('modal-complaint')">Cancel</button><button class="btn-primary" onclick="saveComplaint()">Log Entry</button></div>
+  </div>
+</div>
+
+<!-- AI Settings -->
+<div class="modal-overlay" id="modal-ai-settings" onclick="if(event.target===this)closeModal('modal-ai-settings')">
+  <div class="modal-box" style="max-width:560px">
+    <div class="modal-header">
+      <span class="modal-title">⚙ AI Settings</span>
+      <button class="modal-close" onclick="closeModal('modal-ai-settings')">×</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- API Key -->
+      <div class="settings-section">
+        <div class="settings-section-title">Groq API Key</div>
+        <div class="key-row">
+          <input type="password" id="ais-apikey" placeholder="gsk_…" style="flex:1"/>
+          <button class="btn-icon" id="ais-toggle-key" onclick="toggleKeyVisible()" title="Show/hide">👁</button>
+          <button class="btn-icon" onclick="pasteApiKey()" title="Paste from clipboard">📋</button>
+          <button class="btn-icon" onclick="clearApiKey()" title="Clear key" style="color:var(--red)">✕</button>
+        </div>
+        <button class="btn-sm btn-secondary" id="ais-test-btn" onclick="testApiKey()" style="align-self:flex-start">Test Connection</button>
+        <div class="test-result" id="ais-test-result"></div>
+      </div>
+
+      <!-- Model -->
+      <div class="settings-section">
+        <div class="settings-section-title">Model</div>
+        <div class="form-group"><select id="ais-model"></select></div>
+      </div>
+
+      <!-- Temperature -->
+      <div class="settings-section">
+        <div class="settings-section-title">Temperature <span style="color:var(--dim);font-weight:400;font-size:11px">(0 = focused · 2 = creative)</span></div>
+        <div class="slider-row">
+          <span style="color:var(--dim);font-size:11px">0.00</span>
+          <input type="range" id="ais-temp" min="0" max="200" step="1" oninput="onTempChange(this.value)"/>
+          <span style="color:var(--dim);font-size:11px">2.00</span>
+          <span class="slider-val" id="ais-temp-label">0.70</span>
+        </div>
+      </div>
+
+      <!-- Max tokens -->
+      <div class="settings-section">
+        <div class="settings-section-title">Max Tokens</div>
+        <div class="slider-row">
+          <span style="color:var(--dim);font-size:11px">128</span>
+          <input type="range" id="ais-tokens" min="0" max="31" step="1" oninput="onTokensChange(this.value)"/>
+          <span style="color:var(--dim);font-size:11px">4096</span>
+          <span class="slider-val" id="ais-tokens-label">1024</span>
+        </div>
+      </div>
+
+      <!-- System Prompt -->
+      <div class="settings-section">
+        <div class="settings-section-title">System Prompt</div>
+        <div class="form-group"><textarea id="ais-prompt" rows="5" style="font-size:12px;line-height:1.5"></textarea></div>
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <button class="btn-sm btn-danger" onclick="resetAiDefaults()">Reset Defaults</button>
+      <button class="btn-sm btn-secondary" onclick="closeModal('modal-ai-settings')">Cancel</button>
+      <button class="btn-primary" onclick="saveAiSettings()">Save Settings</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+</body>
+</html>
